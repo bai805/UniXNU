@@ -1,0 +1,201 @@
+name: Data seed (macOS)
+
+# Build a Data seed (data.dbr, DBRDISK1 packed APFS) from the target IPSW on a macOS runner.
+#
+# The seed is a host-side input: macOS hdiutil/diskutil create the APFS Data volume, copy the
+# original OS /private/var, pack it with drivers/DarwinBoot/Test/packed_ramdisk.py, and grow the
+# container to the tablet's Data allocation. The tablet only consumes the seed at install time.
+#
+# Run this from a fork of UniXNU (it uses UniXNU's scripts and OS profile). The device repository
+# supplies the defconfig and OS profile selection; no submodules of the device repository are needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_repository:
+        description: Device repository as owner/name
+        required: true
+        default: UniXNU/UniXNU-sheng
+      device_ref:
+        description: Device repository ref
+        required: true
+        default: main
+      defconfig:
+        description: Defconfig name in the device repository (configs/)
+        required: true
+        default: sheng_defconfig
+      grow_gib:
+        description: Data container size in GiB (3..1024)
+        required: true
+        default: "8"
+      skip_setup:
+        description: Mark Setup as done in a copy of the seed (boots to SpringBoard)
+        type: boolean
+        default: false
+      ipsw_url:
+        description: Optional IPSW URL override (empty uses the OS profile URL)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-seed-${{ github.ref }}-${{ inputs.device_repository }}-${{ inputs.device_ref }}-${{ inputs.defconfig }}
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    # macos-26 is the image the UniXNU macOS workflow is developed with; any macOS image with
+    # hdiutil/diskutil works for this job.
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVICE: ${{ github.workspace }}/device
+      DEFCONFIG: ${{ inputs.defconfig }}
+      GROW_GIB: ${{ inputs.grow_gib }}
+      IPSW: ${{ inputs.ipsw_url }}
+      SKIP_SETUP: ${{ inputs.skip_setup }}
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # drivers/DarwinBoot/Test/packed_ramdisk.py is a submodule and is required by the seed tools.
+          submodules: recursive
+
+      - name: Check out the device repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.device_repository }}
+          ref: ${{ inputs.device_ref }}
+          path: device
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Check the inputs
+        run: |
+          set -euo pipefail
+          [ -f device/board.toml ] || { echo "::error::the device repository has no board.toml"; exit 1; }
+          [ -f "device/configs/$DEFCONFIG" ] || {
+            echo "::error::device/configs/$DEFCONFIG not found: $(cd device/configs 2>/dev/null && printf '%s ' *_defconfig)"
+            exit 1
+          }
+          [[ "$GROW_GIB" =~ ^[0-9]+$ ]] || { echo "::error::grow_gib must be a whole number of GiB"; exit 1; }
+          if [ "$GROW_GIB" -lt 3 ] || [ "$GROW_GIB" -gt 1024 ]; then
+            echo "::error::grow_gib must be between 3 and 1024"; exit 1
+          fi
+
+      - name: Select the device and fetch the OS disk image
+        run: |
+          set -euo pipefail
+          ./unixnu defconfig "$DEFCONFIG" -D "$DEVICE"
+          if [ -n "$IPSW" ]; then
+            ./unixnu ipsw fetch OS -D "$DEVICE" --ipsw "$IPSW"
+          else
+            ./unixnu ipsw fetch OS -D "$DEVICE"
+          fi
+          dmg=$(ls out/ipsw/*/044-76040-038.dmg | head -1)
+          [ -f "$dmg" ] || { echo "::error::the OS member 044-76040-038.dmg was not fetched"; exit 1; }
+          echo "OS image: $dmg ($(stat -f %z "$dmg") bytes)"
+
+      - name: Mount the OS volume
+        id: mount
+        run: |
+          set -euo pipefail
+          dmg=$(ls out/ipsw/*/044-76040-038.dmg | head -1)
+          root="$RUNNER_TEMP/os-mount"
+          mkdir -p "$root"
+          hdiutil attach -readonly -noverify -nobrowse -mountroot "$root" "$dmg"
+          volume=""
+          for d in "$root"/*; do
+            if [ -f "$d/sbin/launchd" ]; then volume="$d"; break; fi
+          done
+          [ -n "$volume" ] || { echo "::error::no mounted OS volume with sbin/launchd"; exit 1; }
+          mkdir -p .cache/firmware/target-volumes
+          ln -sfn "$volume" .cache/firmware/target-volumes/os-mount
+          echo "volume=$volume" >> "$GITHUB_OUTPUT"
+          echo "Mounted $volume"
+
+      - name: Create and pack the 32 MiB Data fixture
+        run: |
+          set -euo pipefail
+          python3 scripts/prepare-owner-data-fixture.py --output build/owner-data-fixture
+          python3 drivers/DarwinBoot/Test/packed_ramdisk.py \
+            build/owner-data-fixture/owner-data-32.cdr \
+            build/owner-data-fixture/owner-data-32.dbr
+          cat build/owner-data-fixture/seed.json
+
+      - name: Grow the Data container
+        run: |
+          set -euo pipefail
+          python3 scripts/seed-data-grow.py --gib "$GROW_GIB" \
+            build/owner-data-fixture/owner-data-32.dbr data.dbr
+          ls -lh data.dbr
+
+      - name: Mark Setup as done
+        if: ${{ inputs.skip_setup }}
+        run: |
+          set -euo pipefail
+          python3 scripts/seed-data-skip-setup.py data.dbr data-skip-setup.dbr --no-auto-dim
+          ls -lh data-skip-setup.dbr
+
+      - name: Report the seed identity
+        run: |
+          set -euo pipefail
+          mkdir -p seed-output
+          cp data.dbr seed-output/
+          if [ -f data-skip-setup.dbr ]; then cp data-skip-setup.dbr seed-output/; fi
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          seed = json.loads(pathlib.Path('build/owner-data-fixture/seed.json').read_text())
+          result = {
+              'volume_uuid': seed['volume_uuid'],
+              'grow_gib': int(os.environ['GROW_GIB']),
+              'skip_setup': os.environ['SKIP_SETUP'] == 'true',
+              'device_repository': os.environ.get('GITHUB_REPOSITORY', ''),
+              'files': {},
+          }
+          for path in sorted(pathlib.Path('seed-output').glob('*.dbr')):
+              result['files'][path.name] = {
+                  'bytes': path.stat().st_size,
+                  'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+          uuid = result['volume_uuid']
+          pathlib.Path('seed-output/seed-info.json').write_text(json.dumps(result, indent=2) + '\n')
+          pathlib.Path('seed-output/defconfig-patch.txt').write_text(
+              'CONFIG_XNU_OWNER_DATA_VOLUME_UUID="' + uuid + '"\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('### Data seed\n\n')
+              summary.write(f'- Volume UUID: `{uuid}`\n')
+              summary.write(f'- Container: {result["grow_gib"]} GiB, Setup skipped: {result["skip_setup"]}\n')
+              for name, info in result['files'].items():
+                  summary.write(f'- `{name}`: {info["bytes"]} bytes, SHA-256 `{info["sha256"]}`\n')
+              summary.write('\nIf the UUID differs from `CONFIG_XNU_OWNER_DATA_VOLUME_UUID` in the device\n')
+              summary.write('defconfig, update the defconfig (`defconfig-patch.txt`) and rebuild the kernel.\n\n')
+              summary.write('Rebuild the payload with:\n\n')
+              summary.write('```sh\n')
+              summary.write('./unixnu build payload -D ../UniXNU-sheng --data-ramdisk data.dbr \\\n')
+              summary.write('  --trust-cache /path/to/original-static-system.bundle --unique-chip-id <hex>\n')
+              summary.write('./unixnu bootimg -D ../UniXNU-sheng --uefi ../uefi-sheng --dtb <hardware.dtb>\n')
+              summary.write('```\n')
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Upload the seed
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: data-seed
+          path: seed-output/
+          if-no-files-found: error
+
+      - name: Detach the OS volume
+        if: always()
+        run: |
+          if [ -n "${{ steps.mount.outputs.volume }}" ]; then
+            hdiutil detach "${{ steps.mount.outputs.volume }}" || true
+          fi
